@@ -32,6 +32,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang_tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
 )
+from sglang_tpu.attention_pallas_rpa_base import _get_pages_per_seq
 from sglang_tpu.attention_pallas_rpa_dcp import (
     _all_reduce_gather,
     gather_heads,
@@ -280,6 +281,8 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
 
     # Set by _build_kernel_op under the q-block opt-in.
     _prefill_op = None
+    # Set by the compile policy to warm one dcp_gather_buckets() length.
+    _dcp_gather_bucket_override: Optional[int] = None
     # Under DCP this backend shards the latents and index keys itself and
     # merges the partial attention (_forward_mla_dcp).
     _dcp_owns_forward: ClassVar[bool] = True
@@ -508,6 +511,52 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             key_store,
         )
 
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        if self._dcp > 1 and not forward_batch.forward_mode.is_decode():
+            self._add_dcp_gather_metadata(forward_batch)
+
+    def dcp_gather_buckets(self, batch_size: int) -> list[int]:
+        """Lengths ``dcp_gather_index`` takes for prefill batches of
+        ``batch_size`` rows; each is a compiled prefill variant."""
+        if self._dcp == 1:
+            return []
+        cap = batch_size * _get_pages_per_seq(self.max_context_len, self._page_stride)
+        buckets = [1 << i for i in range(cap.bit_length()) if (1 << i) < cap]
+        return buckets + [cap]
+
+    def _add_dcp_gather_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Gather list and dense page table for this prefill: only the live
+        sequences' widened pages, padded to a bucket (page 0 of row 0)."""
+        md = self.forward_metadata
+        bs = md.cu_q_lens.shape[0] - 1
+        pages_per_seq = md.page_indices.shape[0] // bs
+        seq_lens = forward_batch.seq_lens_cpu
+        seq_lens = (list(seq_lens) if isinstance(seq_lens, list) else seq_lens.tolist())[:bs]
+        need = [-(-int(n) // self._page_stride) for n in seq_lens]
+        total = sum(need)
+        size = self._dcp_gather_bucket_override or next(
+            b for b in self.dcp_gather_buckets(bs) if b >= total
+        )
+        gather = torch.zeros(size, dtype=torch.int64)
+        dense = torch.zeros(bs, pages_per_seq * self._dcp, dtype=torch.int32)
+        offset = 0
+        for row, n in enumerate(need):
+            # Only a warmup bucket below the need truncates (its rows are dummies).
+            n = max(0, min(n, size - offset))
+            gather[offset : offset + n] = row * pages_per_seq + torch.arange(n)
+            dense[row, : n * self._dcp] = offset * self._dcp + torch.arange(
+                n * self._dcp, dtype=torch.int32
+            )
+            offset += n
+        device = md.page_indices.device
+        md.dcp_gather_index = self._value_metadata(
+            name="dcp_gather_index", value=gather, device=device
+        )
+        md.dcp_dense_pages = self._value_metadata(
+            name="dcp_dense_pages", value=dense.reshape(-1), device=device
+        )
+
     @staticmethod
     def _dcp_seq_lens(forward_batch: ForwardBatch) -> torch.Tensor:
         """Unsharded KV length per sequence, counting this step's tokens: the
@@ -515,16 +564,16 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         return forward_batch.seq_lens.to(torch.int32)
 
     def _dcp_dense_cache(self, shard: torch.Tensor) -> torch.Tensor:
-        """The batch's pages of a DCP-sharded cache, put together unsharded.
+        """The live sequences' pages of a DCP-sharded cache, put together
+        unsharded, at the page table ``dcp_dense_pages``.
 
-        Each rank reads its physical page of every widened page in the page
-        table and the group gathers them, so dense page ``(s * pages_per_seq +
-        j) * dcp + r`` holds rank r's run of sequence s's widened page j:
-        sequence s's tokens in order, at the page table ``_dcp_dense_pages``.
-        Sized by the page table (static), not by the sequences' lengths.
+        Each rank reads its physical page of the widened pages listed in
+        ``dcp_gather_index`` and the group gathers them, so dense page
+        ``g * dcp + r`` holds rank r's run of the g-th listed widened page.
         """
         md = self.forward_metadata
-        pages = shard.index_select(0, md.page_indices.long())
+        page_ids = md.page_indices.index_select(0, md.dcp_gather_index)
+        pages = shard.index_select(0, page_ids.long())
         # Zero-padded int32 sums are exact; bytes are summed as words.
         words = pages.view(torch.int32)
         gathered = _all_reduce_gather(
@@ -534,14 +583,6 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             gathered.reshape(pages.shape[0] * self._dcp, *words.shape[1:])
             .view(shard.dtype)
             .contiguous()
-        )
-
-    def _dcp_dense_pages(self) -> torch.Tensor:
-        """Page table of ``_dcp_dense_cache``: sequence s's unsharded page u is
-        dense page ``s * pages_per_seq * dcp + u``."""
-        num_pages = self.forward_metadata.page_indices.shape[0] * self._dcp
-        return torch.arange(
-            num_pages, dtype=torch.int32, device=self.forward_metadata.page_indices.device
         )
 
     def _index_topk_dcp_dense(
@@ -566,7 +607,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             head_weights.contiguous(),
             dense,
             seq_lens,
-            self._dcp_dense_pages(),
+            self.forward_metadata.dcp_dense_pages,
             md.cu_q_lens,
             md.distribution,
             weight_scale,
@@ -803,7 +844,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._dcp_dense_cache(cache_nope),
             self._dcp_dense_cache(cache_rope),
             seq_lens,
-            self._dcp_dense_pages(),
+            self.forward_metadata.dcp_dense_pages,
             cu_q_lens,
             cu_kv_lens,
             distribution,

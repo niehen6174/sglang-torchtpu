@@ -156,6 +156,13 @@ class PallasForwardMetadata:
     dcp_kv_lens_global: torch.Tensor | None = None
     # i32[1]  this rank's index inside its DCP group
     dcp_cp_rank: torch.Tensor | None = None
+    # Backends whose prefill gathers the DCP shards (pallas_tpu_mla_sparse):
+    # i64[G]  entries of page_indices to gather (the live sequences' widened
+    # pages; G is bucketed, so its shape keys the compiled prefill)
+    dcp_gather_index: torch.Tensor | None = None
+    # i32[max_num_seqs * pages_per_seq * dcp]  unsharded page table into the
+    # gathered pages
+    dcp_dense_pages: torch.Tensor | None = None
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
