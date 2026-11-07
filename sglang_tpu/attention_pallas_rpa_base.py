@@ -570,6 +570,10 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
     # Set by each subclass to select the kernel variant; None on the base only.
     kernel_spec: ClassVar[RpaKernelSpec | None] = None
 
+    # True on a subclass whose own forward handles the DCP-sharded cache and
+    # the cross-rank merge; it then gets the DCP metadata but not the MHA DCP op.
+    _dcp_owns_forward: ClassVar[bool] = False
+
     # The torch custom op exposes KV updates as an in-place mutation, so syncing
     # model outputs during TPU precompile is enough to execute the graph.
     requires_kv_sync_after_compile = False
@@ -624,7 +628,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                     "SGLANG_TPU_REQ_TO_TOKEN_ON_HOST=1 (the default)."
                 )
             cls = type(self)
-            if (
+            if not cls._dcp_owns_forward and (
                 cls.forward_decode is not BaseTpuPallasRpaAttnBackend.forward_decode
                 or cls.forward_extend is not BaseTpuPallasRpaAttnBackend.forward_extend
             ):
@@ -647,7 +651,8 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 torch.arange(self._dcp, dtype=torch.int64, device=self.device)
                 == self._dcp_rank
             )
-            self._dcp_op = build_dcp_kernel_op(self.kernel_spec)
+            if not cls._dcp_owns_forward:
+                self._dcp_op = build_dcp_kernel_op(self.kernel_spec)
 
         max_bs = get_exec().graph.torch_compile_max_bs
         if max_bs:
@@ -1206,7 +1211,7 @@ class BaseTpuPallasRpaAttnBackend(AttentionBackend):
                 target_host = torch.where(
                     is_single, seq_lens_host, seq_lens_host - ext_host
                 )
-                if forward_batch.forward_mode.is_mixed():
+                if forward_batch.forward_mode.is_mixed() and not self._dcp_owns_forward:
                     # SGLang appends the running (decode) rows after the
                     # prefill rows, which is the kernel's batch order: the
                     # trailing single-token run takes the decode tile and the

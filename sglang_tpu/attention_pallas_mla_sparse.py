@@ -19,7 +19,7 @@ layout the sparse kernels read.
 # NOTE: do *not* add ``from __future__ import annotations`` here — see the
 # annotation-introspection note in attention_pallas_rpa_v3.py.
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, ClassVar, Optional
 
 import torch
 
@@ -31,6 +31,16 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang_tpu.attention_pallas_mla import (
     TpuPallasMlaAttnBackend,
+)
+from sglang_tpu.attention_pallas_rpa_dcp import (
+    _all_reduce_gather,
+    gather_heads,
+    merge_across_ranks,
+)
+from sglang_tpu.dsa_dcp_ops import (
+    build_dsa_index_topk_dcp_op,
+    build_dsa_topk_merge_dcp_op,
+    build_sparse_mla_attention_dcp_op,
 )
 from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
@@ -268,6 +278,9 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
 
     # Set by _build_kernel_op under the q-block opt-in.
     _prefill_op = None
+    # Under DCP this backend shards the latents and index keys itself and
+    # merges the partial attention (_forward_mla_dcp).
+    _dcp_owns_forward: ClassVar[bool] = True
 
     def __init__(
         self, model_runner: "ModelRunner", speculative_step_id: int = 0
@@ -282,7 +295,31 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             self._index_topk_op = build_dsa_kpool_topk_op()
         else:
             self._index_topk_op = build_dsa_index_topk_op()
-        self._init_indexer_token_split()
+        if self._dcp > 1:
+            self._init_dcp_ops()
+        else:
+            self._init_indexer_token_split()
+
+    def _init_dcp_ops(self) -> None:
+        """Ops of the DCP path. The latents and index keys are page-striped:
+        rank r holds the r-th page_size run of every widened page."""
+        if self._kpool > 1:
+            raise ValueError(
+                "Decode context parallelism supports plain DSA only, not the "
+                f"pooled indexer (index_kpool={self._kpool})."
+            )
+        # The DCP path scores only the shard; the token split has nothing to do.
+        self._idx_split_group = None
+        self._dcp_interleave = self.page_size
+        self._index_topk_dcp_op = build_dsa_index_topk_dcp_op(
+            self._dcp, self._dcp_interleave
+        )
+        self._topk_merge_dcp_op = build_dsa_topk_merge_dcp_op(
+            self._dcp, self._dcp_interleave
+        )
+        self._attention_dcp_op = build_sparse_mla_attention_dcp_op(
+            self._dcp, self._dcp_interleave
+        )
 
     def _init_indexer_token_split(self) -> None:
         """Set up SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT (plain DSA, attn-TP > 1)."""
@@ -347,7 +384,10 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         # opt-in adds a prefill op: decode, verify and draft extend keep the
         # per-query kernel.
         self._prefill_op = None
-        if not tpu_envs.SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL.get():
+        if (
+            not tpu_envs.SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL.get()
+            or self._dcp > 1
+        ):
             return _build_pallas_sparse_mla_kernel_op()
         if self._kpool == 1:
             # Plain DSA: token-bitmap q-block prefill. Its fallback (short or
@@ -410,6 +450,14 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         positions, counted from the start of the token's own sequence. The
         chosen positions come first and the rest of the row is ``-1``.
         """
+        if self._dcp > 1:
+            return self._index_topk_dcp(
+                layer_id=layer_id,
+                query=query,
+                key=key,
+                head_weights=head_weights,
+                weight_scale=weight_scale,
+            )
         metadata = self.forward_metadata
         num_tokens = query.shape[0]
         split_rows = self._indexer_split_rows(forward_batch, num_tokens)
@@ -440,6 +488,47 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             metadata.decode_query_size,
             metadata.segments,
             key_store,
+        )
+
+    def _index_topk_dcp(
+        self,
+        *,
+        layer_id: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        head_weights: torch.Tensor,
+        weight_scale: float,
+    ) -> torch.Tensor:
+        """index_topk under DCP: this rank's rows of the global top-k, as
+        rank-local positions (what _forward_mla_dcp hands the kernel)."""
+        metadata = self.forward_metadata
+        indices, scores = self._index_topk_dcp_op(
+            query.contiguous(),
+            key.contiguous(),
+            head_weights.contiguous(),
+            self.token_to_kv_pool.get_index_key_cache(layer_id),
+            metadata.dcp_kv_lens_global,
+            metadata.page_indices,
+            metadata.cu_q_lens,
+            metadata.distribution,
+            self._cp_rank_t,
+            weight_scale,
+            self._topk,
+            metadata.segments,
+        )
+        # One gather for both: int32 sums of zero-padded blocks are exact.
+        candidates = _all_reduce_gather(
+            torch.stack([indices, scores]).unsqueeze(0),
+            self._dcp_group,
+            self._dcp,
+            self._cp_rank_mask,
+            dim=0,
+        )  # i32[dcp, 2, num_tokens, topk]
+        return self._topk_merge_dcp_op(
+            candidates[:, 0].contiguous(),
+            candidates[:, 1].contiguous(),
+            self._cp_rank_t,
+            self._topk,
         )
 
     def _index_topk_token_split(
@@ -554,6 +643,9 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             q_rope=q_rope,
             k_rope=k_rope,
         )
+        if self._dcp > 1:
+            out = self._forward_mla_dcp(args, topk_indices)
+            return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         if (
             self._prefill_op is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
@@ -575,6 +667,62 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             out = self._op(*args, topk_indices)
         # TODO(sglang-torchtpu#1072): avoid this reshape, as in pallas_tpu_mla.
         return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_mla_dcp(
+        self, args: tuple, topk_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """Attend with the DCP group's heads over this rank's winners, then
+        merge the group's partials by log-sum-exp and keep this rank's heads.
+
+        ``topk_indices`` are rank-local rows from ``_index_topk_dcp``.
+        """
+        (
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            cache_nope,
+            cache_rope,
+            _kv_lens,
+            page_indices,
+            cu_q_lens,
+            _cu_kv_lens,
+            distribution,
+            sm_scale,
+            k_scale,
+            _v_scale,
+        ) = args
+        md = self.forward_metadata
+        group, cp, rank_mask = self._dcp_group, self._dcp, self._cp_rank_mask
+        nope_dim = ql_nope.shape[-1]
+        q_all = gather_heads(
+            torch.cat([ql_nope, q_pe], dim=-1), group, cp, rank_mask
+        )  # [T, heads * dcp, 576]
+        out, lse = self._attention_dcp_op(
+            q_all[..., :nope_dim].contiguous(),
+            q_all[..., nope_dim:].contiguous(),
+            new_kv_c,
+            new_k_pe,
+            cache_nope,
+            cache_rope,
+            md.dcp_kv_lens_global,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            self._cp_rank_t,
+            topk_indices,
+            sm_scale,
+            k_scale,
+        )
+        # A row with no owned winner (or a padding row) has l = 0: its lse is
+        # -inf or NaN. NaN would poison the group-wide max, so pin it to -inf.
+        lse = torch.where(
+            torch.isfinite(lse), lse, torch.full_like(lse, float("-inf"))
+        )
+        merged, _ = merge_across_ranks(
+            out.float(), lse, group, cp, rank_mask, self._cp_rank_index
+        )
+        return merged.to(ql_nope.dtype)
 
     def _kv_cache_buffers(self, layer_id: int) -> tuple:
         # This backend's pool has two buffers per layer where the fused pool
