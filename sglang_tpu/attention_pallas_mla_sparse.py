@@ -40,7 +40,9 @@ from sglang_tpu.attention_pallas_rpa_dcp import (
 from sglang_tpu.dsa_dcp_ops import (
     build_dsa_index_topk_dcp_op,
     build_dsa_topk_merge_dcp_op,
+    build_index_key_store_dcp_op,
     build_sparse_mla_attention_dcp_op,
+    build_sparse_mla_kv_store_dcp_op,
 )
 from sglang_tpu.dsa_indexer_tpu import (
     build_dsa_index_topk_op,
@@ -320,6 +322,12 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         self._attention_dcp_op = build_sparse_mla_attention_dcp_op(
             self._dcp, self._dcp_interleave
         )
+        self._index_key_store_dcp_op = build_index_key_store_dcp_op(
+            self._dcp, self._dcp_interleave
+        )
+        self._kv_store_dcp_op = build_sparse_mla_kv_store_dcp_op(
+            self._dcp, self._dcp_interleave
+        )
 
     def _init_indexer_token_split(self) -> None:
         """Set up SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT (plain DSA, attn-TP > 1)."""
@@ -450,8 +458,18 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         positions, counted from the start of the token's own sequence. The
         chosen positions come first and the rest of the row is ``-1``.
         """
+        if self._dcp > 1 and not forward_batch.forward_mode.is_decode():
+            return self._index_topk_dcp_dense(
+                seq_lens=self._dcp_seq_lens(forward_batch),
+                layer_id=layer_id,
+                query=query,
+                key=key,
+                head_weights=head_weights,
+                weight_scale=weight_scale,
+            )
         if self._dcp > 1:
             return self._index_topk_dcp(
+                seq_lens=self._dcp_seq_lens(forward_batch),
                 layer_id=layer_id,
                 query=query,
                 key=key,
@@ -490,9 +508,88 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             key_store,
         )
 
+    @staticmethod
+    def _dcp_seq_lens(forward_batch: ForwardBatch) -> torch.Tensor:
+        """Unsharded KV length per sequence, counting this step's tokens: the
+        kv_lens of an unsharded forward (DCP rejects speculative modes)."""
+        return forward_batch.seq_lens.to(torch.int32)
+
+    def _dcp_dense_cache(self, shard: torch.Tensor) -> torch.Tensor:
+        """The batch's pages of a DCP-sharded cache, put together unsharded.
+
+        Each rank reads its physical page of every widened page in the page
+        table and the group gathers them, so dense page ``(s * pages_per_seq +
+        j) * dcp + r`` holds rank r's run of sequence s's widened page j:
+        sequence s's tokens in order, at the page table ``_dcp_dense_pages``.
+        Sized by the page table (static), not by the sequences' lengths.
+        """
+        md = self.forward_metadata
+        pages = shard.index_select(0, md.page_indices.long())
+        # Zero-padded int32 sums are exact; bytes are summed as words.
+        words = pages.view(torch.int32)
+        gathered = _all_reduce_gather(
+            words, self._dcp_group, self._dcp, self._cp_rank_mask, dim=1
+        )
+        return (
+            gathered.reshape(pages.shape[0] * self._dcp, *words.shape[1:])
+            .view(shard.dtype)
+            .contiguous()
+        )
+
+    def _dcp_dense_pages(self) -> torch.Tensor:
+        """Page table of ``_dcp_dense_cache``: sequence s's unsharded page u is
+        dense page ``s * pages_per_seq * dcp + u``."""
+        num_pages = self.forward_metadata.page_indices.shape[0] * self._dcp
+        return torch.arange(
+            num_pages, dtype=torch.int32, device=self.forward_metadata.page_indices.device
+        )
+
+    def _index_topk_dcp_dense(
+        self,
+        *,
+        seq_lens: torch.Tensor,
+        layer_id: int,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        head_weights: torch.Tensor,
+        weight_scale: float,
+    ) -> torch.Tensor:
+        """index_topk under DCP for prefill: the unsharded indexer over the
+        gathered index keys (rows identical to an unsharded server), and the
+        owned keys stored in this rank's shard."""
+        md = self.forward_metadata
+        shard = self.token_to_kv_pool.get_index_key_cache(layer_id)
+        dense = self._dcp_dense_cache(shard)
+        rows = self._index_topk_op(
+            query.contiguous(),
+            key.contiguous(),
+            head_weights.contiguous(),
+            dense,
+            seq_lens,
+            self._dcp_dense_pages(),
+            md.cu_q_lens,
+            md.distribution,
+            weight_scale,
+            self._topk,
+            md.decode_query_size,
+            md.segments,
+            "xla",
+        )
+        self._index_key_store_dcp_op(
+            key.contiguous(),
+            shard,
+            seq_lens,
+            md.page_indices,
+            md.cu_q_lens,
+            md.distribution,
+            self._cp_rank_t,
+        )
+        return rows
+
     def _index_topk_dcp(
         self,
         *,
+        seq_lens: torch.Tensor,
         layer_id: int,
         query: torch.Tensor,
         key: torch.Tensor,
@@ -507,7 +604,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             key.contiguous(),
             head_weights.contiguous(),
             self.token_to_kv_pool.get_index_key_cache(layer_id),
-            metadata.dcp_kv_lens_global,
+            seq_lens,
             metadata.page_indices,
             metadata.cu_q_lens,
             metadata.distribution,
@@ -644,7 +741,12 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             k_rope=k_rope,
         )
         if self._dcp > 1:
-            out = self._forward_mla_dcp(args, topk_indices)
+            forward_dcp = (
+                self._forward_mla_dcp
+                if forward_batch.forward_mode.is_decode()
+                else self._forward_mla_dcp_dense
+            )
+            out = forward_dcp(args, topk_indices, self._dcp_seq_lens(forward_batch))
             return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
         if (
             self._prefill_op is not None
@@ -668,8 +770,63 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         # TODO(sglang-torchtpu#1072): avoid this reshape, as in pallas_tpu_mla.
         return out.reshape(q.shape[0], layer.tp_q_head_num * layer.v_head_dim)
 
+    def _forward_mla_dcp_dense(
+        self, args: tuple, topk_indices: torch.Tensor, seq_lens: torch.Tensor
+    ) -> torch.Tensor:
+        """Prefill under DCP: the unsharded op, with this rank's heads, over the
+        gathered latents; the owned latents stored in this rank's shards.
+
+        ``topk_indices`` are unsharded rows from ``_index_topk_dcp_dense``.
+        """
+        (
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            cache_nope,
+            cache_rope,
+            _kv_lens,
+            page_indices,
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            sm_scale,
+            k_scale,
+            v_scale,
+        ) = args
+        md = self.forward_metadata
+        out = self._op(
+            ql_nope,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            self._dcp_dense_cache(cache_nope),
+            self._dcp_dense_cache(cache_rope),
+            seq_lens,
+            self._dcp_dense_pages(),
+            cu_q_lens,
+            cu_kv_lens,
+            distribution,
+            sm_scale,
+            k_scale,
+            v_scale,
+            topk_indices,
+        )
+        self._kv_store_dcp_op(
+            new_kv_c,
+            new_k_pe,
+            cache_nope,
+            cache_rope,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            self._cp_rank_t,
+        )
+        return out
+
     def _forward_mla_dcp(
-        self, args: tuple, topk_indices: torch.Tensor
+        self, args: tuple, topk_indices: torch.Tensor, seq_lens: torch.Tensor
     ) -> torch.Tensor:
         """Attend with the DCP group's heads over this rank's winners, then
         merge the group's partials by log-sum-exp and keep this rank's heads.
@@ -705,7 +862,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             new_k_pe,
             cache_nope,
             cache_rope,
-            md.dcp_kv_lens_global,
+            seq_lens,
             page_indices,
             cu_q_lens,
             distribution,

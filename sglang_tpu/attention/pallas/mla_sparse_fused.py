@@ -260,6 +260,40 @@ def sparse_mla_attention_fused(
     return out[..., :NOPE_DIM], cache_nope, cache_rope
 
 
+def store_sparse_mla_kv_dcp(
+    new_kv_c: jax.Array,  # fp8[max_num_tokens, 512]
+    new_k_pe: jax.Array,  # fp8[max_num_tokens, 64]
+    cache_nope: jax.Array,  # u8[num_pages, page_size, 4, 128]; this rank's shard
+    cache_rope: jax.Array,  # u8[num_pages, page_size // 4, 4, 128]
+    seq_lens: jax.Array,  # i32[max_num_seqs]; global, counts this step's tokens
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]; widened pages
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]; [2] is the number of real requests
+    dcp_rank: jax.Array,  # i32[1]
+    *,
+    dcp_size: int,
+    interleave_size: int,
+) -> tuple[jax.Array, jax.Array]:
+    """Store the tokens of this step this rank owns in its NoPE/RoPE shards."""
+    num_pages, page_size = cache_nope.shape[:2]
+    nope_spec, rope_spec = _split_specs(num_pages, page_size)
+    active_cu_q_lens = jnp.minimum(cu_q_lens, cu_q_lens[distribution[2]])
+    return kv_cache_utils.update_sparse_mla_kv_cache_dcp(
+        cache_nope,
+        cache_rope,
+        new_kv_c,
+        new_k_pe,
+        seq_lens,
+        page_indices,
+        active_cu_q_lens,
+        dcp_rank.reshape(()),
+        nope_spec=nope_spec,
+        rope_spec=rope_spec,
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+
+
 def sparse_mla_attention_fused_dcp(
     ql_nope: jax.Array,  # bf16[max_num_tokens, num_q_heads, 512]; the DCP group's heads
     q_pe: jax.Array,  # bf16[max_num_tokens, num_q_heads, 64]
@@ -287,20 +321,16 @@ def sparse_mla_attention_fused_dcp(
     ``lse`` ``f32[max_num_tokens, num_q_heads]``, which the caller merges
     across the group. A row with no owned winner has a non-finite ``lse``.
     """
-    num_pages, page_size = cache_nope.shape[:2]
-    nope_spec, rope_spec = _split_specs(num_pages, page_size)
-    active_cu_q_lens = jnp.minimum(cu_q_lens, cu_q_lens[distribution[2]])
-    cache_nope, cache_rope = kv_cache_utils.update_sparse_mla_kv_cache_dcp(
-        cache_nope,
-        cache_rope,
+    cache_nope, cache_rope = store_sparse_mla_kv_dcp(
         new_kv_c,
         new_k_pe,
+        cache_nope,
+        cache_rope,
         seq_lens,
         page_indices,
-        active_cu_q_lens,
-        dcp_rank.reshape(()),
-        nope_spec=nope_spec,
-        rope_spec=rope_spec,
+        cu_q_lens,
+        distribution,
+        dcp_rank,
         dcp_size=dcp_size,
         interleave_size=interleave_size,
     )

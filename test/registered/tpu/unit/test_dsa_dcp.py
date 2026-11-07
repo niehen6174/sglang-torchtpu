@@ -83,8 +83,10 @@ class _Layout:
 
     def __init__(self, seq_lens, rng):
         num_seqs = len(seq_lens)
-        self.ref_pages_per_seq = _cdiv(max(seq_lens), _PAGE_SIZE)
-        self.dcp_pages_per_seq = _cdiv(max(seq_lens), _PAGE_SIZE * _DCP)
+        # Headroom for a second chunk (TestDsaDcpDensePrefill).
+        max_len = max(seq_lens) + _PAGE_SIZE * _DCP
+        self.ref_pages_per_seq = _cdiv(max_len, _PAGE_SIZE)
+        self.dcp_pages_per_seq = _cdiv(max_len, _PAGE_SIZE * _DCP)
         ref_ids = rng.permutation(num_seqs * self.ref_pages_per_seq)
         dcp_ids = rng.permutation(_PAGES_PER_RANK)[: num_seqs * self.dcp_pages_per_seq]
         self.ref_pages = ref_ids.astype(np.int32)
@@ -267,6 +269,66 @@ class TestDsaDcp(CustomTestCase):
         diff = np.abs(got - want)
         self.assertLess(float(diff.max()), _MAX_ABS_DIFF)
         self.assertLess(float(diff.mean()), _MEAN_ABS_DIFF)
+
+
+class TestDsaDcpDensePrefill(CustomTestCase):
+    """Prefill under DCP gathers the shards into an unsharded cache
+    (TpuPallasSparseMlaAttnBackend._dcp_dense_cache) and runs the unsharded
+    ops, so its rows and outputs must equal an unsharded server's bit for bit."""
+
+    def test_dense_gather_reproduces_unsharded_step(self):
+        base = TestDsaDcp
+        base.setUpClass()
+        rng = np.random.default_rng(2)
+        num_seqs = len(_SEQ_LENS)
+        # A second chunk of 256 tokens per sequence on top of the prefill.
+        chunk = 256
+        x = _random_inputs(rng, chunk * num_seqs)
+        seq_lens = jnp.asarray(np.asarray(_SEQ_LENS, np.int32) + chunk)
+        cu = jnp.asarray(np.arange(num_seqs + 1, dtype=np.int32) * chunk)
+        dist = jnp.asarray(np.array([0, 0, num_seqs], np.int32))
+
+        ref_pages = jnp.asarray(base.layout.ref_pages)
+        ref_rows, _ = dsa_indexer_step(
+            x["query"], x["key"], x["head_weights"], base.ref_cache_k,
+            seq_lens, ref_pages, cu, dist,
+            weight_scale=_WEIGHT_SCALE, topk=_TOPK, segments="mixed",
+        )  # fmt: skip
+        ref_out, _, _ = sparse_mla_attention_fused(
+            x["ql_nope"], x["q_pe"], x["new_kv_c"], x["new_k_pe"],
+            base.ref_nope, base.ref_rope, seq_lens, ref_pages, cu, dist, ref_rows,
+            sm_scale=_SM_SCALE, k_scale=1.0,
+        )  # fmt: skip
+
+        dense = [_dense_cache([s[i] for s in base.shards], base.layout.dcp_pages) for i in range(3)]
+        dense_pages = jnp.arange(len(base.layout.dcp_pages) * _DCP, dtype=jnp.int32)
+        rows, _ = dsa_indexer_step(
+            x["query"], x["key"], x["head_weights"], dense[0],
+            seq_lens, dense_pages, cu, dist,
+            weight_scale=_WEIGHT_SCALE, topk=_TOPK, segments="mixed",
+        )  # fmt: skip
+        out, _, _ = sparse_mla_attention_fused(
+            x["ql_nope"], x["q_pe"], x["new_kv_c"], x["new_k_pe"],
+            dense[1], dense[2], seq_lens, dense_pages, cu, dist, rows,
+            sm_scale=_SM_SCALE, k_scale=1.0,
+        )  # fmt: skip
+        rows, ref_rows = np.asarray(rows), np.asarray(ref_rows)
+        for t in range(chunk * num_seqs):
+            self.assertEqual(
+                set(rows[t][rows[t] >= 0].tolist()),
+                set(ref_rows[t][ref_rows[t] >= 0].tolist()),
+            )
+        np.testing.assert_array_equal(
+            np.asarray(out, np.float32), np.asarray(ref_out, np.float32)
+        )
+
+
+def _dense_cache(shards, pages) -> jax.Array:
+    """``_dcp_dense_cache`` for simulated ranks: each rank's pages of the page
+    table, rank-major inside every widened page."""
+    per_rank = [np.asarray(s)[pages] for s in shards]  # [ranks][N, ...]
+    stacked = np.stack(per_rank, axis=1)  # [N, ranks, ...]
+    return jnp.asarray(stacked.reshape(-1, *stacked.shape[2:]))
 
 
 class TestDsaDcpDecode(CustomTestCase):

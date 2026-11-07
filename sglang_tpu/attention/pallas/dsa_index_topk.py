@@ -271,6 +271,37 @@ def dsa_indexer_step(
     return topk_indices, cache_k
 
 
+def store_index_keys_dcp(
+    key: jax.Array,  # float[max_num_tokens, index_head_dim]
+    cache_k: jax.Array,  # u8[num_pages, page_size // 4, 4, record_bytes]; this rank's shard
+    seq_lens: jax.Array,  # i32[max_num_seqs]; global, counts this step's tokens
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]; widened pages
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    distribution: jax.Array,  # i32[3]; [2] is the number of real requests
+    dcp_rank: jax.Array,  # i32[1]
+    *,
+    dcp_size: int,
+    interleave_size: int,
+) -> jax.Array:
+    """Store the keys of this step this rank owns in its index-key shard, at
+    the (page, slot) the MLA latent writer uses for them."""
+    k_fp8, _, k_scale_byte = quantize_fp8_ue8m0(key)
+    records = _key_records(cache_k, k_fp8, k_scale_byte)
+    active_cu_q_lens = jnp.minimum(cu_q_lens, cu_q_lens[distribution[2]])
+    page, slot = kv_cache_utils.get_dcp_page_and_slot(
+        key.shape[0],
+        seq_lens,
+        page_indices,
+        active_cu_q_lens,
+        dcp_rank.reshape(()),
+        page_size=cache_k.shape[1] * cache_k.shape[2],
+        num_pages=cache_k.shape[0],
+        dcp_size=dcp_size,
+        interleave_size=interleave_size,
+    )
+    return _scatter_whole_rows(cache_k, records, page, slot)
+
+
 def dsa_indexer_step_dcp(
     query: jax.Array,  # float[max_num_tokens, index_n_heads, index_head_dim]
     key: jax.Array,  # float[max_num_tokens, index_head_dim]
@@ -302,21 +333,17 @@ def dsa_indexer_step_dcp(
     """
     rank = dcp_rank.reshape(())
     q_fp8, q_scale, _ = quantize_fp8_ue8m0(query)
-    k_fp8, _, k_scale_byte = quantize_fp8_ue8m0(key)
-    records = _key_records(cache_k, k_fp8, k_scale_byte)
-    active_cu_q_lens = jnp.minimum(cu_q_lens, cu_q_lens[distribution[2]])
-    page, slot = kv_cache_utils.get_dcp_page_and_slot(
-        key.shape[0],
+    cache_k = store_index_keys_dcp(
+        key,
+        cache_k,
         seq_lens,
         page_indices,
-        active_cu_q_lens,
-        rank,
-        page_size=cache_k.shape[1] * cache_k.shape[2],
-        num_pages=cache_k.shape[0],
+        cu_q_lens,
+        distribution,
+        dcp_rank,
         dcp_size=dcp_size,
         interleave_size=interleave_size,
     )
-    cache_k = _scatter_whole_rows(cache_k, records, page, slot)
 
     weights = head_weights.astype(jnp.float32) * q_scale[..., 0] * weight_scale
     global_indices, scores = streamindex_topk(

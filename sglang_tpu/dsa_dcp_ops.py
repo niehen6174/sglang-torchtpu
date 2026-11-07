@@ -314,3 +314,163 @@ def build_sparse_mla_attention_dcp_op(dcp_size: int, interleave_size: int):
     custom_op.register_fake(_fake_impl)
     _OPS[key] = custom_op
     return custom_op
+
+
+def build_index_key_store_dcp_op(dcp_size: int, interleave_size: int):
+    """Register ``store_index_keys_dcp`` (owned keys into the shard) as a torch
+    custom op mutating ``cache_k``."""
+    key = ("index_store", dcp_size, interleave_size)
+    if key in _OPS:
+        return _OPS[key]
+
+    import jax
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.attention.pallas.dsa_index_topk import store_index_keys_dcp
+
+    op_name = f"sglang_tpu_pallas::dsa_index_key_store_dcp{dcp_size}_i{interleave_size}"
+
+    def _wrapped(
+        key: jax.Array,
+        cache_k: jax.Array,
+        seq_lens: jax.Array,
+        page_indices: jax.Array,
+        cu_q_lens: jax.Array,
+        distribution: jax.Array,
+        dcp_rank: jax.Array,
+    ) -> jax.Array:
+        return store_index_keys_dcp(
+            key,
+            cache_k,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            dcp_rank,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+
+    (cache_argnum,) = argnums(_wrapped, "cache_k")
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        _wrapped,
+        name=f"jax_{op_name}",
+        donate_argnums=(cache_argnum,),
+        input_output_aliases={cache_argnum: 0},
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(op_name, mutates_args=("cache_k",), device_types=["tpu"])
+    def custom_op(
+        key: torch.Tensor,
+        cache_k: torch.Tensor,
+        seq_lens: torch.Tensor,
+        page_indices: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        dcp_rank: torch.Tensor,
+    ) -> None:
+        with tpu_info_for_cpu_export():
+            jax_kernel(
+                key, cache_k, seq_lens, page_indices, cu_q_lens, distribution, dcp_rank
+            )
+
+    @custom_op.register_fake
+    def _(key, cache_k, seq_lens, page_indices, cu_q_lens, distribution, dcp_rank):
+        return None
+
+    _OPS[key] = custom_op
+    return custom_op
+
+
+def build_sparse_mla_kv_store_dcp_op(dcp_size: int, interleave_size: int):
+    """Register ``store_sparse_mla_kv_dcp`` (owned latents into the shards) as
+    a torch custom op mutating ``cache_nope`` and ``cache_rope``."""
+    key = ("kv_store", dcp_size, interleave_size)
+    if key in _OPS:
+        return _OPS[key]
+
+    import jax
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.attention.pallas.mla_sparse_fused import store_sparse_mla_kv_dcp
+
+    op_name = f"sglang_tpu_pallas::sparse_mla_kv_store_dcp{dcp_size}_i{interleave_size}"
+
+    def _wrapped(
+        new_kv_c: jax.Array,
+        new_k_pe: jax.Array,
+        cache_nope: jax.Array,
+        cache_rope: jax.Array,
+        seq_lens: jax.Array,
+        page_indices: jax.Array,
+        cu_q_lens: jax.Array,
+        distribution: jax.Array,
+        dcp_rank: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        return store_sparse_mla_kv_dcp(
+            new_kv_c,
+            new_k_pe,
+            cache_nope,
+            cache_rope,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            dcp_rank,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+
+    nope_argnum, rope_argnum = argnums(_wrapped, "cache_nope", "cache_rope")
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        _wrapped,
+        name=f"jax_{op_name}",
+        donate_argnums=(nope_argnum, rope_argnum),
+        input_output_aliases={nope_argnum: 0, rope_argnum: 1},
+        warn_deprecated=False,
+    )
+
+    @torch.library.custom_op(
+        op_name, mutates_args=("cache_nope", "cache_rope"), device_types=["tpu"]
+    )
+    def custom_op(
+        new_kv_c: torch.Tensor,
+        new_k_pe: torch.Tensor,
+        cache_nope: torch.Tensor,
+        cache_rope: torch.Tensor,
+        seq_lens: torch.Tensor,
+        page_indices: torch.Tensor,
+        cu_q_lens: torch.Tensor,
+        distribution: torch.Tensor,
+        dcp_rank: torch.Tensor,
+    ) -> None:
+        with tpu_info_for_cpu_export():
+            jax_kernel(
+                new_kv_c,
+                new_k_pe,
+                cache_nope,
+                cache_rope,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                dcp_rank,
+            )
+
+    @custom_op.register_fake
+    def _(
+        new_kv_c,
+        new_k_pe,
+        cache_nope,
+        cache_rope,
+        seq_lens,
+        page_indices,
+        cu_q_lens,
+        distribution,
+        dcp_rank,
+    ):
+        return None
+
+    _OPS[key] = custom_op
+    return custom_op
