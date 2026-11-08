@@ -173,6 +173,10 @@ class TpuEnvs:
     # latency overlaps the in-host exchange (twolevel_allreduce._kernel). Same
     # sums. Only changes anything with more than one host.
     SGLANG_TPU_TWOLEVEL_ALLREDUCE_SPLIT_BARRIER = EnvBool(False)
+    # That all-reduce: the most rows (decode batch size) it takes; larger
+    # batches keep XLA's all-reduce. 1 = single-token decode only, where it
+    # was measured; the kernel packs up to MAX_ELEMS elements.
+    SGLANG_TPU_TWOLEVEL_ALLREDUCE_MAX_ROWS = EnvInt(1)
     # That all-reduce: Kimi-K3's merged MoE reduce also applies the routed
     # latent RMSNorm in the kernel (one op instead of the reduce + two norm
     # fusions). The norm runs on the [1, H] row, which reproduces XLA's f32
