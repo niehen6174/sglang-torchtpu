@@ -522,7 +522,9 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         if self._dcp == 1:
             return []
         cap = batch_size * _get_pages_per_seq(self.max_context_len, self._page_stride)
-        buckets = [1 << i for i in range(cap.bit_length()) if (1 << i) < cap]
+        # Powers of 4: half the compiled prefill variants of powers of 2 (each
+        # a cold compile), for at most 4x the gathered pages.
+        buckets = [4**i for i in range(cap.bit_length()) if 4**i < cap]
         return buckets + [cap]
 
     def _add_dcp_gather_metadata(self, forward_batch: ForwardBatch) -> None:

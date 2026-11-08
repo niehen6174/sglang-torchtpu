@@ -173,6 +173,10 @@ class TpuEnvs:
     # latency overlaps the in-host exchange (twolevel_allreduce._kernel). Same
     # sums. Only changes anything with more than one host.
     SGLANG_TPU_TWOLEVEL_ALLREDUCE_SPLIT_BARRIER = EnvBool(False)
+    # Seconds between the server's TPU keep-alive matmuls (tpu_keepalive.py), so
+    # a shared pool's idle reclaimer does not take the node during long compiles
+    # or idle serving. 0 = off.
+    SGLANG_TPU_KEEPALIVE_SECONDS = EnvFloat(0.0)
     # That all-reduce: the most rows (decode batch size) it takes; larger
     # batches keep XLA's all-reduce. 1 = single-token decode only, where it
     # was measured; the kernel packs up to MAX_ELEMS elements.

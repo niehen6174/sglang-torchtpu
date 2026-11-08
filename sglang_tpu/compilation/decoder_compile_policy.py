@@ -656,6 +656,11 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
     def install(self) -> bool:
         """Install runtime compile wrappers for the annotated decoder target."""
+        from sglang_tpu.tpu_keepalive import maybe_start_keepalive
+
+        # Before the precompile: a cold compile can leave the chips idle long
+        # enough for a shared pool to reclaim the node.
+        maybe_start_keepalive()
         if self.model_runner is None or self.owner is None or self.method_name is None:
             logger.warning(
                 "[decoder compile policy] missing model_runner/owner/method; "
