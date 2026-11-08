@@ -31,7 +31,11 @@ from sglang_tpu.dsv4.dsv4_memory_pool import (
     TPUDeepSeekV4IndexerPool,
     TPUDeepSeekV4SWAKVPool,
 )
-from sglang_tpu.kv_pool import TpuBlockMajorMHATokenToKVPool, TpuSeqAlongLaneKVPool
+from sglang_tpu.kv_pool import (
+    TpuBlockMajorMHATokenToKVPool,
+    TpuSeqAlongLaneKVPool,
+    TpuSplitMLATokenToKVPool,
+)
 from sglang_tpu.mamba_pool import TpuMambaPool
 from sglang_tpu.unified_kv_pool import TpuUnifiedSWAKVPool
 
@@ -222,7 +226,19 @@ def get_raiden_kv_caches(
 
         layers_mapping = getattr(current_pool, "layers_mapping", None)
         start = current_pool.start_layer
-        if isinstance(current_pool, HybridLinearKVPool):
+        if isinstance(current_pool, HybridLinearKVPool) and isinstance(
+            current_pool.full_kv_pool, TpuSplitMLATokenToKVPool
+        ):
+            # Sparse MLA (Kimi-K3.1): several page-major buffers per layer (NoPE,
+            # RoPE, DSA index keys), all addressed by the request's page ids.
+            split_pool = current_pool.full_kv_pool
+            layer_ids, buffers = [], []
+            for layer_id in sorted(current_pool.full_attention_layer_id_mapping):
+                local_id = current_pool._transfer_full_attention_id(layer_id)
+                for buf in split_pool.get_page_buffers(local_id):
+                    layer_ids.append(layer_id)
+                    buffers.append(buf)
+        elif isinstance(current_pool, HybridLinearKVPool):
             # Only full-attention layers own KV; GDN layers ship as state.
             layer_ids = sorted(current_pool.full_attention_layer_id_mapping)
             buffers = [

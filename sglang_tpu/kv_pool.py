@@ -1487,8 +1487,27 @@ class TpuSplitMLATokenToKVPool(MLATokenToKVPool):
     def get_kv_buffer(self, *args, **kwargs):
         self._unsupported("get_kv_buffer")
 
-    def get_contiguous_buf_infos(self, *args, **kwargs):
-        self._unsupported("get_contiguous_buf_infos")
+    # P/D: the DSA index keys travel with the latents as page buffers
+    # (get_contiguous_buf_infos, Raiden's get_raiden_kv_caches), so the pool
+    # adds no separate DSA state component and has no compressed kpool tail.
+    kpool_use_compress = False
+
+    def get_state_buf_infos(self):
+        return [], [], []
+
+    def get_contiguous_buf_infos(self):
+        # Every page buffer of every layer, in get_page_buffers order (the order
+        # Raiden registers them); each leads with num_pages, so an item is a page.
+        buffers = [
+            buf
+            for layer_id in range(self.start_layer, self.start_layer + self.layer_num)
+            for buf in self.get_page_buffers(layer_id)
+        ]
+        return (
+            [buf.data_ptr() for buf in buffers],
+            [buf.nbytes for buf in buffers],
+            [buf[0].nbytes for buf in buffers],
+        )
 
     def get_cpu_copy(self, *args, **kwargs):
         self._unsupported("get_cpu_copy")
