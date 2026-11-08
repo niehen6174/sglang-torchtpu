@@ -89,6 +89,7 @@ from sglang_tpu.hooks.twolevel_allreduce import (
 from sglang_tpu.hooks.twolevel_allreduce import (
     row_parallel_linear_forward as twolevel_row_parallel_linear_forward,
 )
+from sglang_tpu.hooks.keepalive import keepalive_after_idle
 from sglang_tpu.kv_pool_host import register_unified_hicache_strategy
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,11 @@ logger = logging.getLogger(__name__)
 # (target, hook, hook_type) triples.
 
 HOOKS: list[tuple] = [
+    (
+        "sglang.srt.managers.scheduler.Scheduler.on_idle",
+        keepalive_after_idle,
+        HookType.AFTER,
+    ),
     (
         "sglang.srt.utils.common.set_gpu_proc_affinity",
         bind_rank_cpu_set,

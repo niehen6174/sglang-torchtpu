@@ -316,10 +316,13 @@ def build_sparse_mla_attention_dcp_op(dcp_size: int, interleave_size: int):
     return custom_op
 
 
-def build_index_key_store_dcp_op(dcp_size: int, interleave_size: int):
-    """Register ``store_index_keys_dcp`` (owned keys into the shard) as a torch
-    custom op mutating ``cache_k``."""
-    key = ("index_store", dcp_size, interleave_size)
+def build_index_key_store_gather_dcp_op(dcp_size: int, interleave_size: int):
+    """Register ``store_index_keys_dcp`` followed by a page gather of the
+    updated shard, as one torch custom op mutating ``cache_k``.
+
+    One op owns the shard's update and its read: a second op reading the
+    donated shard made XLA copy the whole shard."""
+    key = ("index_store_gather", dcp_size, interleave_size)
     if key in _OPS:
         return _OPS[key]
 
@@ -327,8 +330,11 @@ def build_index_key_store_dcp_op(dcp_size: int, interleave_size: int):
     from torch_tpu._internal import pallas as _torch_pallas
 
     from sglang_tpu.attention.pallas.dsa_index_topk import store_index_keys_dcp
+    from sglang_tpu.attention.pallas.page_gather import gather_pages
 
-    op_name = f"sglang_tpu_pallas::dsa_index_key_store_dcp{dcp_size}_i{interleave_size}"
+    op_name = (
+        f"sglang_tpu_pallas::dsa_index_key_store_gather_dcp{dcp_size}_i{interleave_size}"
+    )
 
     def _wrapped(
         key: jax.Array,
@@ -338,8 +344,9 @@ def build_index_key_store_dcp_op(dcp_size: int, interleave_size: int):
         cu_q_lens: jax.Array,
         distribution: jax.Array,
         dcp_rank: jax.Array,
-    ) -> jax.Array:
-        return store_index_keys_dcp(
+        gather_page_ids: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        cache_k = store_index_keys_dcp(
             key,
             cache_k,
             seq_lens,
@@ -350,13 +357,14 @@ def build_index_key_store_dcp_op(dcp_size: int, interleave_size: int):
             dcp_size=dcp_size,
             interleave_size=interleave_size,
         )
+        return gather_pages(cache_k, gather_page_ids), cache_k
 
     (cache_argnum,) = argnums(_wrapped, "cache_k")
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
         donate_argnums=(cache_argnum,),
-        input_output_aliases={cache_argnum: 0},
+        input_output_aliases={cache_argnum: 1},
         warn_deprecated=False,
     )
 
@@ -369,24 +377,37 @@ def build_index_key_store_dcp_op(dcp_size: int, interleave_size: int):
         cu_q_lens: torch.Tensor,
         distribution: torch.Tensor,
         dcp_rank: torch.Tensor,
-    ) -> None:
+        gather_page_ids: torch.Tensor,
+    ) -> torch.Tensor:
         with tpu_info_for_cpu_export():
-            jax_kernel(
-                key, cache_k, seq_lens, page_indices, cu_q_lens, distribution, dcp_rank
+            pages, _updated_cache = jax_kernel(
+                key,
+                cache_k,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                dcp_rank,
+                gather_page_ids,
             )
+        return pages
 
-    @custom_op.register_fake
-    def _(key, cache_k, seq_lens, page_indices, cu_q_lens, distribution, dcp_rank):
-        return None
+    def _fake_impl(
+        key, cache_k, seq_lens, page_indices, cu_q_lens, distribution, dcp_rank,
+        gather_page_ids,
+    ):  # fmt: skip
+        return cache_k.new_empty((gather_page_ids.shape[0], *cache_k.shape[1:]))
 
+    custom_op.register_fake(_fake_impl)
     _OPS[key] = custom_op
     return custom_op
 
 
-def build_sparse_mla_kv_store_dcp_op(dcp_size: int, interleave_size: int):
-    """Register ``store_sparse_mla_kv_dcp`` (owned latents into the shards) as
-    a torch custom op mutating ``cache_nope`` and ``cache_rope``."""
-    key = ("kv_store", dcp_size, interleave_size)
+def build_sparse_mla_kv_store_gather_dcp_op(dcp_size: int, interleave_size: int):
+    """Register ``store_sparse_mla_kv_dcp`` followed by a page gather of both
+    updated shards, as one torch custom op mutating ``cache_nope`` and
+    ``cache_rope`` (see build_index_key_store_gather_dcp_op)."""
+    key = ("kv_store_gather", dcp_size, interleave_size)
     if key in _OPS:
         return _OPS[key]
 
@@ -394,8 +415,11 @@ def build_sparse_mla_kv_store_dcp_op(dcp_size: int, interleave_size: int):
     from torch_tpu._internal import pallas as _torch_pallas
 
     from sglang_tpu.attention.pallas.mla_sparse_fused import store_sparse_mla_kv_dcp
+    from sglang_tpu.attention.pallas.page_gather import gather_pages
 
-    op_name = f"sglang_tpu_pallas::sparse_mla_kv_store_dcp{dcp_size}_i{interleave_size}"
+    op_name = (
+        f"sglang_tpu_pallas::sparse_mla_kv_store_gather_dcp{dcp_size}_i{interleave_size}"
+    )
 
     def _wrapped(
         new_kv_c: jax.Array,
@@ -407,8 +431,9 @@ def build_sparse_mla_kv_store_dcp_op(dcp_size: int, interleave_size: int):
         cu_q_lens: jax.Array,
         distribution: jax.Array,
         dcp_rank: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
-        return store_sparse_mla_kv_dcp(
+        gather_page_ids: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        cache_nope, cache_rope = store_sparse_mla_kv_dcp(
             new_kv_c,
             new_k_pe,
             cache_nope,
@@ -421,13 +446,19 @@ def build_sparse_mla_kv_store_dcp_op(dcp_size: int, interleave_size: int):
             dcp_size=dcp_size,
             interleave_size=interleave_size,
         )
+        return (
+            gather_pages(cache_nope, gather_page_ids),
+            gather_pages(cache_rope, gather_page_ids),
+            cache_nope,
+            cache_rope,
+        )
 
     nope_argnum, rope_argnum = argnums(_wrapped, "cache_nope", "cache_rope")
     jax_kernel = _torch_pallas.custom_jax_kernel(
         _wrapped,
         name=f"jax_{op_name}",
         donate_argnums=(nope_argnum, rope_argnum),
-        input_output_aliases={nope_argnum: 0, rope_argnum: 1},
+        input_output_aliases={nope_argnum: 2, rope_argnum: 3},
         warn_deprecated=False,
     )
 
@@ -444,9 +475,10 @@ def build_sparse_mla_kv_store_dcp_op(dcp_size: int, interleave_size: int):
         cu_q_lens: torch.Tensor,
         distribution: torch.Tensor,
         dcp_rank: torch.Tensor,
-    ) -> None:
+        gather_page_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         with tpu_info_for_cpu_export():
-            jax_kernel(
+            nope_pages, rope_pages, _nope, _rope = jax_kernel(
                 new_kv_c,
                 new_k_pe,
                 cache_nope,
@@ -456,53 +488,19 @@ def build_sparse_mla_kv_store_dcp_op(dcp_size: int, interleave_size: int):
                 cu_q_lens,
                 distribution,
                 dcp_rank,
+                gather_page_ids,
             )
+        return nope_pages, rope_pages
 
-    @custom_op.register_fake
-    def _(
-        new_kv_c,
-        new_k_pe,
-        cache_nope,
-        cache_rope,
-        seq_lens,
-        page_indices,
-        cu_q_lens,
-        distribution,
-        dcp_rank,
-    ):
-        return None
-
-    _OPS[key] = custom_op
-    return custom_op
-
-
-def build_gather_pages_op():
-    """Register ``page_gather.gather_pages`` (pages of a cache, one DMA each)."""
-    key = ("gather_pages",)
-    if key in _OPS:
-        return _OPS[key]
-
-    import jax
-    from torch_tpu._internal import pallas as _torch_pallas
-
-    from sglang_tpu.attention.pallas.page_gather import gather_pages
-
-    op_name = "sglang_tpu_pallas::gather_pages"
-
-    def _wrapped(cache: jax.Array, page_ids: jax.Array) -> jax.Array:
-        return gather_pages(cache, page_ids)
-
-    jax_kernel = _torch_pallas.custom_jax_kernel(
-        _wrapped, name=f"jax_{op_name}", warn_deprecated=False
-    )
-
-    @torch.library.custom_op(op_name, mutates_args=(), device_types=["tpu"])
-    def custom_op(cache: torch.Tensor, page_ids: torch.Tensor) -> torch.Tensor:
-        with tpu_info_for_cpu_export():
-            return jax_kernel(cache, page_ids)
-
-    def _fake_impl(cache, page_ids):
-        return cache.new_empty((page_ids.shape[0], *cache.shape[1:]))
+    def _fake_impl(
+        new_kv_c, new_k_pe, cache_nope, cache_rope, seq_lens, page_indices,
+        cu_q_lens, distribution, dcp_rank, gather_page_ids,
+    ):  # fmt: skip
+        g = gather_page_ids.shape[0]
+        return (
+            cache_nope.new_empty((g, *cache_nope.shape[1:])),
+            cache_rope.new_empty((g, *cache_rope.shape[1:])),
+        )
 
     custom_op.register_fake(_fake_impl)
     _OPS[key] = custom_op

@@ -42,4 +42,9 @@ def gather_pages(cache: jax.Array, page_ids: jax.Array) -> jax.Array:
         ),
         out_shape=jax.ShapeDtypeStruct((num_out, *cache.shape[1:]), cache.dtype),
         name="gather_pages",
-    )(page_ids.astype(jnp.int32), cache)
+    )(
+        # A DMA from an out-of-range page faults the chip, where an XLA gather
+        # clamps; warmup's dummy page tables are not guaranteed in range.
+        jnp.clip(page_ids.astype(jnp.int32), 0, cache.shape[0] - 1),
+        cache,
+    )

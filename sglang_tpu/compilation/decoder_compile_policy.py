@@ -87,6 +87,7 @@ from sglang_tpu.host_padding import (
     ordinary_compiled_forward,
 )
 from sglang_tpu.pp_wave import num_relayed_aux_slots
+from sglang_tpu.tpu_keepalive import keepalive_tick
 
 logger = get_logger(__name__)
 
@@ -656,11 +657,6 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
 
     def install(self) -> bool:
         """Install runtime compile wrappers for the annotated decoder target."""
-        from sglang_tpu.tpu_keepalive import maybe_start_keepalive
-
-        # Before the precompile: a cold compile can leave the chips idle long
-        # enough for a shared pool to reclaim the node.
-        maybe_start_keepalive()
         if self.model_runner is None or self.owner is None or self.method_name is None:
             logger.warning(
                 "[decoder compile policy] missing model_runner/owner/method; "
@@ -1828,6 +1824,8 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
                 self.model_runner.token_to_kv_pool,
             )
 
+        # A cold precompile runs minutes per step with the chips idle.
+        keepalive_tick()
         if profile_prefix is not None:
             return (time.perf_counter() - started) * 1000
         return None
