@@ -41,6 +41,7 @@ from sglang_tpu.attention_pallas_rpa_dcp import (
 from sglang_tpu.dsa_dcp_ops import (
     build_dsa_index_topk_dcp_op,
     build_dsa_topk_merge_dcp_op,
+    build_gather_pages_op,
     build_index_key_store_dcp_op,
     build_sparse_mla_attention_dcp_op,
     build_sparse_mla_kv_store_dcp_op,
@@ -331,6 +332,7 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         self._kv_store_dcp_op = build_sparse_mla_kv_store_dcp_op(
             self._dcp, self._dcp_interleave
         )
+        self._gather_pages_op = build_gather_pages_op()
 
     def _init_indexer_token_split(self) -> None:
         """Set up SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT (plain DSA, attn-TP > 1)."""
@@ -575,7 +577,10 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         """
         md = self.forward_metadata
         page_ids = md.page_indices.index_select(0, md.dcp_gather_index)
-        pages = shard.index_select(0, page_ids.long())
+        # A Pallas DMA per page: an index_select of the shard in the compiled
+        # graph laid the whole shard out again (a shard-sized temporary per
+        # cache and layer, past HBM at a 16-request prefill cap).
+        pages = self._gather_pages_op(shard, page_ids.to(torch.int32))
         # Zero-padded int32 sums are exact; bytes are summed as words.
         words = pages.view(torch.int32)
         gathered = _all_reduce_gather(
@@ -602,8 +607,19 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
         owned keys stored in this rank's shard."""
         md = self.forward_metadata
         shard = self.token_to_kv_pool.get_index_key_cache(layer_id)
+        # Store first, then gather: a gather of the shard before its in-place
+        # update makes XLA copy the whole shard (both values live at once).
+        self._index_key_store_dcp_op(
+            key.contiguous(),
+            shard,
+            seq_lens,
+            md.page_indices,
+            md.cu_q_lens,
+            md.distribution,
+            self._cp_rank_t,
+        )
         dense = self._dcp_dense_cache(shard)
-        rows = self._index_topk_op(
+        return self._index_topk_op(
             query.contiguous(),
             key.contiguous(),
             head_weights.contiguous(),
@@ -618,16 +634,6 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             md.segments,
             "xla",
         )
-        self._index_key_store_dcp_op(
-            key.contiguous(),
-            shard,
-            seq_lens,
-            md.page_indices,
-            md.cu_q_lens,
-            md.distribution,
-            self._cp_rank_t,
-        )
-        return rows
 
     def _index_topk_dcp(
         self,
@@ -837,8 +843,19 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             k_scale,
             v_scale,
         ) = args
-        md = self.forward_metadata
-        out = self._op(
+        # Store first, then gather (see _index_topk_dcp_dense).
+        self._kv_store_dcp_op(
+            new_kv_c,
+            new_k_pe,
+            cache_nope,
+            cache_rope,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            self._cp_rank_t,
+        )
+        return self._op(
             ql_nope,
             q_pe,
             new_kv_c,
@@ -855,18 +872,6 @@ class TpuPallasSparseMlaAttnBackend(TpuPallasMlaAttnBackend):
             v_scale,
             topk_indices,
         )
-        self._kv_store_dcp_op(
-            new_kv_c,
-            new_k_pe,
-            cache_nope,
-            cache_rope,
-            seq_lens,
-            page_indices,
-            cu_q_lens,
-            distribution,
-            self._cp_rank_t,
-        )
-        return out
 
     def _forward_mla_dcp(
         self, args: tuple, topk_indices: torch.Tensor, seq_lens: torch.Tensor

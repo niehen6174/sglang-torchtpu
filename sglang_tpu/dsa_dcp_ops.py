@@ -474,3 +474,36 @@ def build_sparse_mla_kv_store_dcp_op(dcp_size: int, interleave_size: int):
 
     _OPS[key] = custom_op
     return custom_op
+
+
+def build_gather_pages_op():
+    """Register ``page_gather.gather_pages`` (pages of a cache, one DMA each)."""
+    key = ("gather_pages",)
+    if key in _OPS:
+        return _OPS[key]
+
+    import jax
+    from torch_tpu._internal import pallas as _torch_pallas
+
+    from sglang_tpu.attention.pallas.page_gather import gather_pages
+
+    op_name = "sglang_tpu_pallas::gather_pages"
+
+    def _wrapped(cache: jax.Array, page_ids: jax.Array) -> jax.Array:
+        return gather_pages(cache, page_ids)
+
+    jax_kernel = _torch_pallas.custom_jax_kernel(
+        _wrapped, name=f"jax_{op_name}", warn_deprecated=False
+    )
+
+    @torch.library.custom_op(op_name, mutates_args=(), device_types=["tpu"])
+    def custom_op(cache: torch.Tensor, page_ids: torch.Tensor) -> torch.Tensor:
+        with tpu_info_for_cpu_export():
+            return jax_kernel(cache, page_ids)
+
+    def _fake_impl(cache, page_ids):
+        return cache.new_empty((page_ids.shape[0], *cache.shape[1:]))
+
+    custom_op.register_fake(_fake_impl)
+    _OPS[key] = custom_op
+    return custom_op

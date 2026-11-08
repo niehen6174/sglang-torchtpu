@@ -399,6 +399,22 @@ class TestDsaDcpDecode(CustomTestCase):
         self.assertLess(float(diff.mean()), _MEAN_ABS_DIFF)
 
 
+class TestGatherPages(CustomTestCase):
+    """The DCP prefill gathers pages with a DMA kernel instead of an XLA gather
+    (which laid out the whole cache again); it must return cache[ids] exactly."""
+
+    def test_gather_pages_equals_take(self):
+        from sglang_tpu.attention.pallas.page_gather import gather_pages
+
+        rng = np.random.default_rng(3)
+        ids = rng.integers(0, 48, size=37).astype(np.int32)
+        ids[5] = ids[6]  # repeated pages
+        for shape in ((48, _PAGE_SIZE, 4, 128), (48, _PAGE_SIZE // 4, 4, 256)):
+            cache = rng.integers(0, 256, size=shape, dtype=np.uint8)
+            got = np.asarray(gather_pages(jnp.asarray(cache), jnp.asarray(ids)))
+            np.testing.assert_array_equal(got, cache[ids])
+
+
 def _merge_partials(outs, lses) -> np.ndarray:
     """Log-sum-exp merge of per-rank ``out [T, H, D]``, ``lse [T, H]``."""
     lse = np.stack(lses)
