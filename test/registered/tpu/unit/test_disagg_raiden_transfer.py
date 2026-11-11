@@ -1123,6 +1123,7 @@ class TestRaidenStateGroups(CustomTestCase):
         pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
         pool.start_layer = 0
         pool.full_attention_layer_id_mapping = {3: 0, 7: 1}
+        pool.full_kv_pool = object()
         kv = {3: torch.zeros(9, 2), 7: torch.zeros(9, 2)}
         pool.get_fused_kv_buffer = lambda layer_id: kv[layer_id]
         pool.mamba_pool = mamba_pool

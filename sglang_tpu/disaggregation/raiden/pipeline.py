@@ -78,7 +78,6 @@ def pool_manifest(groups: Any) -> list[dict]:
         if len(tensors) != len(layer_ids):
             raise ValueError(f"Raiden {kind} pools need one global layer ID per tensor")
         num_target = len(tensors) - num_draft - num_hidden
-        seen: dict[str, int] = {}
         for index, (tensor, layer) in enumerate(zip(tensors, layer_ids)):
             # Draft layer IDs restart at 0, so they need their own namespace; the
             # PD hidden rows have their own page geometry, hence their own class.
@@ -89,12 +88,6 @@ def pool_manifest(groups: Any) -> list[dict]:
             else:
                 tag_kind = f"pdhid.{kind}"
             tag = f"{tag_kind}.l{int(layer)}"
-            # A layer with several buffers (sparse MLA: NoPE, RoPE, index keys)
-            # numbers its later ones; single-buffer layers keep the plain tag.
-            count = seen.get(tag, 0)
-            seen[tag] = count + 1
-            if count:
-                tag += f".{count}"
             if _kv_rank(tensor) == _BLOCK_MAJOR_KV_RANK:
                 tag += f"+{int(tensor.shape[1])}"
             size = math.prod(int(n) for n in tensor.shape[1:]) * tensor.element_size()
