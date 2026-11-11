@@ -80,6 +80,21 @@ def _dcp_stripe(blocks: List[int], *, dcp_size: int, dcp_rank: int) -> List[int]
     return blocks[dcp_rank::dcp_size]
 
 
+def _dcp_stripe_chunk(
+    start: int, block_ids: List[int], total_pages: int, *, dcp_size: int, dcp_rank: int
+) -> tuple[int, List[int], int]:
+    """A chunk of prefill pages [start, start + len) in stripe coordinates: stripe
+    page k is prefill page k * dcp_size + dcp_rank, so a chunk stays contiguous."""
+
+    def stripe_index(page: int) -> int:
+        return max(0, -(-(page - dcp_rank) // dcp_size))
+
+    lo = stripe_index(start)
+    hi = stripe_index(start + len(block_ids))
+    blocks = [block_ids[k * dcp_size + dcp_rank - start] for k in range(lo, hi)]
+    return lo, blocks, stripe_index(total_pages)
+
+
 class RaidenSenderMixin:
     """Prefill-side methods of ``RaidenKVManager``."""
 
@@ -325,13 +340,17 @@ class RaidenSenderMixin:
                     room in self._prefill.replied
                     or room in self._aborted
                     or room not in self._prefill.decode_pages
-                    or room in self._prefill.decode_dcp
                 ):
                     # The closing reply is out (or the room is gone): these
                     # pages travel with the closing transfer instead. A late
                     # announcement must never follow the reply -- the sender
                     # counts the room done when the closing read completes.
                     return
+                dcp = self._prefill.decode_dcp.get(room)
+                if dcp is not None:
+                    start, block_ids, total_pages = _dcp_stripe_chunk(
+                        start, block_ids, total_pages, dcp_size=dcp[0], dcp_rank=dcp[1]
+                    )
                 window = chunk_pull_window(
                     start, len(block_ids), total_pages, self._prefill.decode_pages[room]
                 )

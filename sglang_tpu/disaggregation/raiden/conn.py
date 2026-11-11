@@ -503,9 +503,9 @@ class RaidenKVManager(
         # Full-attention KV moves piece by piece during the prefill. A hybrid
         # model's sliding-window pool holds only the last window, which is
         # settled when the prefill ends, so it rides on the closing read, as
-        # does GDN state. A DCP decode takes its page stripe in one closing
-        # read (sender._dcp_stripe); the prefill announces it no chunks.
-        self.chunked_transfer = self.dcp_size == 1
+        # does GDN state. A DCP decode rank's chunks and closing list are in
+        # stripe coordinates (sender._dcp_stripe_chunk).
+        self.chunked_transfer = True
         if not self._kv_caches:
             raise RuntimeError(
                 "Raiden requires at least one full-attention KV cache tensor"

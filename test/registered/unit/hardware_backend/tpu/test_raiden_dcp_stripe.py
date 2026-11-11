@@ -8,7 +8,8 @@ import pytest
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang_tpu.disaggregation.raiden.receiver import RaidenReceiverMixin
-from sglang_tpu.disaggregation.raiden.sender import _dcp_stripe
+from sglang_tpu.disaggregation.raiden.chunk_plan import chunk_pull_window
+from sglang_tpu.disaggregation.raiden.sender import _dcp_stripe, _dcp_stripe_chunk
 from sglang_tpu.disaggregation.raiden.serde import PullReq
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -32,6 +33,37 @@ def test_every_prefill_page_lands_on_its_owner(dcp_size, num_pages, reserved):
         for src, dst in zip(remote, paired):
             assert src not in placed
             placed[src] = (rank, dst)
+    assert placed == {
+        1000 + s: (s % dcp_size, 10 * (s % dcp_size) + s // dcp_size)
+        for s in range(num_pages)
+    }
+
+
+@pytest.mark.parametrize("dcp_size", [2, 8])
+@pytest.mark.parametrize("num_pages", [5, 37, 64])
+@pytest.mark.parametrize("chunk", [1, 3, 16])
+def test_chunks_in_stripe_coordinates_cover_the_stripe(dcp_size, num_pages, chunk):
+    """Chunks of any size, then the closing read of whatever they missed, put
+    every prefill page on its owner rank at local page s // dcp exactly once."""
+    prefill_pages = [1000 + s for s in range(num_pages)]
+    decode_pages = -(-num_pages // dcp_size) + 1
+    placed = {}
+    for rank in range(dcp_size):
+        local = [10 * rank + k for k in range(decode_pages)]
+        covered = []
+        for start in range(0, num_pages, chunk):
+            k0, blocks, total = _dcp_stripe_chunk(
+                start, prefill_pages[start : start + chunk], num_pages,
+                dcp_size=dcp_size, dcp_rank=rank,
+            )
+            window = chunk_pull_window(k0, len(blocks), total, decode_pages)
+            assert window.chunk_offset == 0 and window.length == len(blocks)
+            for k, blk in zip(range(k0, k0 + len(blocks)), blocks):
+                assert blk not in placed
+                placed[blk] = (rank, local[k])  # receiver: base 0 under DCP
+                covered.append(k)
+        stripe = _dcp_stripe(prefill_pages, dcp_size=dcp_size, dcp_rank=rank)
+        assert sorted(covered) == list(range(len(stripe)))
     assert placed == {
         1000 + s: (s % dcp_size, 10 * (s % dcp_size) + s // dcp_size)
         for s in range(num_pages)

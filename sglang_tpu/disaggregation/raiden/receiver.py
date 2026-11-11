@@ -540,8 +540,9 @@ class RaidenReceiverMixin:
                 closing = req_id == str(room)
                 # The decode holds the last len(local) pages; pages below that
                 # base were already here, or reserved for the first decode
-                # token, and are not pulled.
-                base = total - len(local)
+                # token, and are not pulled. A DCP rank's stripe page k is its
+                # local page k, and its widened pages may outnumber the stripe.
+                base = 0 if self.dcp_size > 1 else total - len(local)
                 pairs = [
                     (blk, local[pg - base])
                     for pg, blk in zip(pages, blocks)
