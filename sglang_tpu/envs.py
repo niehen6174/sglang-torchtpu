@@ -180,6 +180,12 @@ class TpuEnvs:
     SGLANG_TPU_KEEPALIVE_SECONDS = EnvFloat(0.0)
     # Arbitrary: tpuq's reclaimer ignored a ~0.003% load and kept a 20% one.
     SGLANG_TPU_KEEPALIVE_DUTY = EnvFloat(0.2)
+    # Sparse MLA DCP prefill (EXTEND / MIXED) on the decode path: each rank scores and
+    # attends over its own shard with the group's query heads, and the group merges
+    # the top-k candidates and the partial outputs. Per-chunk traffic depends on the
+    # chunk only. False gathers the batch's pages into an unsharded cache instead,
+    # whose traffic and temporaries grow with the gathered history.
+    SGLANG_TPU_DCP_PREFILL_HEAD_PARALLEL = EnvBool(False)
     # That all-reduce: the most rows (decode batch size) it takes; larger
     # batches keep XLA's all-reduce. 1 = single-token decode only, where it
     # was measured; the kernel packs up to MAX_ELEMS elements.

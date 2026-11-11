@@ -1014,14 +1014,15 @@ def _validate_decode_context_parallel(server_args) -> None:
 
 
 def _validate_sparse_mla_dcp() -> None:
-    """Sparse MLA DCP replaces the indexer token split and the q-block prefill
-    kernel; refuse the switches that would ask for them."""
+    """Sparse MLA DCP has no q-block prefill kernel, and its head-parallel
+    prefill no indexer token split; refuse the switches that would ask for them.
+    The gathered prefill scores the unsharded cache, so it takes the split."""
     from sglang_tpu.envs import envs as tpu_envs
 
-    for env in (
-        tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT,
-        tpu_envs.SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL,
-    ):
+    refused = [tpu_envs.SGLANG_TPU_ENABLE_QBLOCK_SPARSE_MLA_PREFILL]
+    if tpu_envs.SGLANG_TPU_DCP_PREFILL_HEAD_PARALLEL.get():
+        refused.append(tpu_envs.SGLANG_TPU_DSA_INDEXER_TOKEN_SPLIT)
+    for env in refused:
         if env.get():
             raise ValueError(
                 f"{env.name}=1 is not supported with "
