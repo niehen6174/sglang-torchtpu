@@ -72,12 +72,20 @@ class PullReq(WireMessage):
     # Window pages the decode allocated for the room; the sender registers
     # only the window blocks it will read.
     decode_swa_pages: int = 0
+    # A decode-context-parallel decode rank stores prefill page s iff
+    # s % dcp_size == dcp_rank (sparse MLA page striping); 1/0 for no DCP.
+    dcp_size: int = 1
+    dcp_rank: int = 0
 
     def __post_init__(self) -> None:
         require_non_negative(self.room, "room")
         require_non_negative(self.decode_pages, "decode_pages")
         require_non_negative(self.decode_swa_pages, "decode_swa_pages")
         _require_port(self.decode_port)
+        if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
+            raise ValueError(
+                f"PullReq dcp_rank {self.dcp_rank} out of range for dcp_size {self.dcp_size}"
+            )
 
 
 class Blocks(WireMessage):

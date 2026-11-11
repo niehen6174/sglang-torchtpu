@@ -173,6 +173,10 @@ class RaidenKVManager(
     # The legacy transport unless set_kv_caches builds a pipeline transfer.
     _pipeline = None
     _pipeline_enabled = False
+    # CommonKVManager.__init__ sets the real values; these cover a manager
+    # built without it (unit fixtures) as a decode without DCP.
+    dcp_size = 1
+    dcp_rank = 0
     # Host layer buffers per transfer, from SGLANG_TPU_RAIDEN_STAGING_LAYERS.
     _staging_layers_total = 0
     # Whether an engine stages through fewer host buffers than device layers.
@@ -499,8 +503,9 @@ class RaidenKVManager(
         # Full-attention KV moves piece by piece during the prefill. A hybrid
         # model's sliding-window pool holds only the last window, which is
         # settled when the prefill ends, so it rides on the closing read, as
-        # does GDN state.
-        self.chunked_transfer = True
+        # does GDN state. A DCP decode takes its page stripe in one closing
+        # read (sender._dcp_stripe); the prefill announces it no chunks.
+        self.chunked_transfer = self.dcp_size == 1
         if not self._kv_caches:
             raise RuntimeError(
                 "Raiden requires at least one full-attention KV cache tensor"
@@ -1457,6 +1462,7 @@ class RaidenKVManager(
                     self._prefill.send_total,
                     self._prefill.decode_pages,
                     self._prefill.decode_swa_pages,
+                    self._prefill.decode_dcp,
                     self._prefill.chunk_seq,
                     self._prefill.reshard_chunks,
                     self._prefill.pending_offer,

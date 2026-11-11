@@ -301,6 +301,8 @@ class RaidenReceiverMixin:
             decode_port=self.rank_port,
             decode_pages=len(local_blocks),
             decode_swa_pages=len(local_swa_blocks),
+            dcp_size=self.dcp_size,
+            dcp_rank=self.dcp_rank,
         ).to_frames()
         for info in bootstrap_infos:
             endpoint = _tcp_endpoint(ip=info["rank_ip"], port=info["rank_port"])

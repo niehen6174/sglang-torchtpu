@@ -73,6 +73,13 @@ def _first_repeated_block(
     return None
 
 
+def _dcp_stripe(blocks: List[int], *, dcp_size: int, dcp_rank: int) -> List[int]:
+    """The pages a DCP decode rank stores: sparse MLA stripes whole pages, so
+    rank r holds prefill page s iff s % dcp_size == r, at its own page s // dcp_size.
+    The decode pairs this list with its pages in order (receiver._pair_blocks)."""
+    return blocks[dcp_rank::dcp_size]
+
+
 class RaidenSenderMixin:
     """Prefill-side methods of ``RaidenKVManager``."""
 
@@ -89,6 +96,8 @@ class RaidenSenderMixin:
                 self._prefill.decode_addr[room] = (decode_ip, decode_port)
                 self._prefill.decode_pages[room] = decode_pages
                 self._prefill.decode_swa_pages[room] = decode_swa_pages
+                if req.dcp_size > 1:
+                    self._prefill.decode_dcp[room] = (req.dcp_size, req.dcp_rank)
                 held = self._prefill.held_chunks.pop(room, [])
                 total_pages = self._prefill.send_total.get(room, 0)
         if failed_reason is not None:
@@ -316,6 +325,7 @@ class RaidenSenderMixin:
                     room in self._prefill.replied
                     or room in self._aborted
                     or room not in self._prefill.decode_pages
+                    or room in self._prefill.decode_dcp
                 ):
                     # The closing reply is out (or the room is gone): these
                     # pages travel with the closing transfer instead. A late
@@ -637,7 +647,10 @@ class RaidenSenderMixin:
             state_meta = self._prefill.send_state_meta.get(room, b"")
             decode_pages = self._prefill.decode_pages[room]
             decode_swa_pages = self._prefill.decode_swa_pages[room]
+            dcp = self._prefill.decode_dcp.get(room)
             self._prefill.replied.add(room)
+        if dcp is not None:
+            blocks = _dcp_stripe(blocks, dcp_size=dcp[0], dcp_rank=dcp[1])
         # Register only the suffix requested by the decode node to prevent
         # unread blocks from leaking leases until deadline timeout.
         read_blocks = whole_pull_registration(blocks, decode_pages)

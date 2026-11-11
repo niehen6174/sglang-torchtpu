@@ -885,6 +885,19 @@ _DCP_SPARSE_MLA_BACKEND = "pallas_tpu_mla_sparse"
 _UNSET_CHUNKED_PREFILL_SIZE = 4096
 
 
+def _raiden_sparse_mla_dcp_decode(cfg) -> bool:
+    """A sparse MLA decode on the Raiden pull transfer: each DCP rank pulls its
+    stripe of the prefill's pages (raiden sender._dcp_stripe)."""
+    from sglang_tpu.envs import envs as tpu_envs
+
+    return (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_transfer_backend == "raiden"
+        and cfg.attention_backend == _DCP_SPARSE_MLA_BACKEND
+        and not tpu_envs.SGLANG_RAIDEN_PIPELINE_TRANSFER.get()
+    )
+
+
 def _validate_decode_context_parallel(server_args) -> None:
     """Refuse the server-arg combinations TPU decode context parallelism does
     not implement.
@@ -944,10 +957,11 @@ def _validate_decode_context_parallel(server_args) -> None:
             "--enable-prefill-cp is not supported with "
             "--decode-context-parallel-size > 1 on TPU."
         )
-    if cfg.disaggregation_mode != "null":
+    if cfg.disaggregation_mode != "null" and not _raiden_sparse_mla_dcp_decode(cfg):
         raise ValueError(
             "--disaggregation-mode is not supported with "
-            "--decode-context-parallel-size > 1 on TPU (got "
+            "--decode-context-parallel-size > 1 on TPU, except a "
+            f"{_DCP_SPARSE_MLA_BACKEND} decode on the Raiden pull transfer (got "
             f"{cfg.disaggregation_mode!r})."
         )
     if cfg.enable_hierarchical_cache:
@@ -1601,6 +1615,11 @@ class TpuSRTPlatform(SRTPlatform):
     def dcp_attention_backend_merges_mla(self) -> bool:
         # pallas_tpu_mla_sparse gathers the heads and merges the partials itself.
         return True
+
+    def pd_dcp_transfer_backends(self) -> tuple[str, ...]:
+        # Raiden hands each sparse MLA DCP rank its page stripe; the platform
+        # check (_raiden_sparse_mla_dcp_decode) limits it to that backend.
+        return ("raiden",)
 
     def supports_moe_dp_pipeline_stages(self) -> bool:
         return True

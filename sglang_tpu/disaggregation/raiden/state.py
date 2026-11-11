@@ -34,6 +34,8 @@ class PrefillState:
     send_total: Dict[int, int] = field(default_factory=dict)
     decode_pages: Dict[int, int] = field(default_factory=dict)
     decode_swa_pages: Dict[int, int] = field(default_factory=dict)
+    # (dcp_size, dcp_rank) of a DCP decode peer; absent for a peer without DCP.
+    decode_dcp: Dict[int, Tuple[int, int]] = field(default_factory=dict)
 
     # Announced reshard chunks retained until the decode requests their push.
     reshard_chunks: Dict[int, Dict[int, Tuple[int, List[int]]]] = field(

@@ -336,6 +336,11 @@ class SRTPlatform(DeviceMixin):
         forward_mla skips its own q all-gather, extend KV gather and LSE merge."""
         return False
 
+    def pd_dcp_transfer_backends(self) -> tuple[str, ...]:
+        """P/D transfer backends, beyond the built-in ones, that relayout KV for
+        a decode-context-parallel decode on this platform."""
+        return ()
+
     # TODO(yinlin09): needs an upstream seam issue; carry it as a sglang_tpu/hooks/
     # entry until the seam PR merges upstream.
     def supports_moe_dp_pipeline_stages(self) -> bool:
