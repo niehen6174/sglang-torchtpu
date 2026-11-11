@@ -1798,10 +1798,13 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
         ):
             started = time.perf_counter()
             async_warmup = getattr(self.owner.forward, "warmup_async_fn", None)
+            # An async warmup compiles at submission and skips the keep-alive below;
+            # with the keep-alive on, warm up synchronously so a burst follows every compile.
             if (
                 profile_prefix is None
                 and self.tracer == "direct"
                 and envs.SGLANG_DIRECT_COMPILE_ASYNC.get()
+                and tpu_envs.SGLANG_TPU_KEEPALIVE_SECONDS.get() <= 0
                 and self._supports_async_warmup()
                 and async_warmup is not None
             ):
@@ -1825,7 +1828,7 @@ class DecoderTpuCompilePolicy(DecoderCompilePolicy):
             )
 
         # A cold precompile runs minutes per step with the chips idle.
-        keepalive_tick()
+        keepalive_tick(catch_up=True)
         if profile_prefix is not None:
             return (time.perf_counter() - started) * 1000
         return None

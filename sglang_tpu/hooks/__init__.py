@@ -89,7 +89,7 @@ from sglang_tpu.hooks.twolevel_allreduce import (
 from sglang_tpu.hooks.twolevel_allreduce import (
     row_parallel_linear_forward as twolevel_row_parallel_linear_forward,
 )
-from sglang_tpu.hooks.keepalive import keepalive_after_idle
+from sglang_tpu.hooks.keepalive import keepalive_after_idle, keepalive_while_loading
 from sglang_tpu.kv_pool_host import register_unified_hicache_strategy
 
 logger = logging.getLogger(__name__)
@@ -100,6 +100,11 @@ HOOKS: list[tuple] = [
     (
         "sglang.srt.managers.scheduler.Scheduler.on_idle",
         keepalive_after_idle,
+        HookType.AFTER,
+    ),
+    (
+        "sglang.srt.model_loader.loader.DefaultModelLoader._get_all_weights",
+        keepalive_while_loading,
         HookType.AFTER,
     ),
     (
