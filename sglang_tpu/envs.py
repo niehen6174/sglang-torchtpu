@@ -186,6 +186,11 @@ class TpuEnvs:
     # chunk only. False gathers the batch's pages into an unsharded cache instead,
     # whose traffic and temporaries grow with the gathered history.
     SGLANG_TPU_DCP_PREFILL_HEAD_PARALLEL = EnvBool(False)
+    # Gathered sparse MLA DCP prefill: unsharded scratch slots (requests in
+    # prefill at once) every rank keeps, so a request prefilled from its first
+    # token reads its history there instead of gathering it at every chunk.
+    # Each slot holds max-context latents and index keys; 0 gathers always.
+    SGLANG_TPU_DCP_PREFILL_SCRATCH = EnvInt(0)
     # That all-reduce: the most rows (decode batch size) it takes; larger
     # batches keep XLA's all-reduce. 1 = single-token decode only, where it
     # was measured; the kernel packs up to MAX_ELEMS elements.

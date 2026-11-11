@@ -163,6 +163,8 @@ class PallasForwardMetadata:
     # i32[max_num_seqs * pages_per_seq * dcp]  unsharded page table into the
     # gathered pages
     dcp_dense_pages: torch.Tensor | None = None
+    # dcp_dense_pages addresses the backend's prefill scratch, not gathered pages.
+    dcp_scratch: bool = False
 
 
 def _make_active_num_tokens(cu_q_lens: torch.Tensor, non_empty_bs: int) -> torch.Tensor:
